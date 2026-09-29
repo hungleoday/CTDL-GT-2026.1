@@ -1,0 +1,238 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# --- 1. Data Preparation & Normalization ---
+data = load_breast_cancer()
+x = data.data 
+y = data.target 
+y = y.reshape(-1, 1)
+
+x_train, x_test, y_train, y_test = train_test_split(
+    x, y, test_size=0.2, random_state=42
+)
+
+# Input Normalization
+scaler = StandardScaler()
+X_train = scaler.fit_transform(x_train)
+X_test = scaler.transform(x_test)
+
+
+# --- 2. Activation Functions ---
+class ReLU:
+
+  def forward(self, Z):
+    self.Z = Z
+    return np.maximum(0, Z)
+
+  def backward(self, dA):
+    return dA * (self.Z > 0)
+
+
+class Sigmoid:
+
+  def forward(self, Z):
+    self.A = 1 / (1 + np.exp(-np.clip(Z, -500, 500)))
+    return self.A
+
+  def backward(self, dA):
+    return dA * self.A * (1 - self.A)
+
+
+# --- 3. Dense Layer (Weight Initialization & L2 Regularization) ---
+class Dense:
+
+  def __init__(self, input_dim, output_dim, l2_lambda=0.001):
+    # He Initialization
+    self.W = np.random.randn(input_dim, output_dim) * np.sqrt(2.0 / input_dim)
+    self.b = np.zeros((1, output_dim))
+    self.l2_lambda = l2_lambda
+
+    self.dW = None
+    self.db = None
+    self.X = None
+
+  def forward(self, X):
+    self.X = X
+    # Matrix multiplication & vectorization
+    return np.dot(X, self.W) + self.b
+
+  def backward(self, dZ):
+    m = self.X.shape[0]
+    self.dW = np.dot(self.X.T, dZ) / m + self.l2_lambda * self.W
+    self.db = np.sum(dZ, axis=0, keepdims=True) / m
+    dX = np.dot(dZ, self.W.T)
+    return dX
+
+
+# --- 4. Dropout Layer ---
+class Dropout:
+
+  def __init__(self, drop_rate=0.2):
+    self.drop_rate = drop_rate
+    self.mask = None
+
+  def forward(self, X, training=True):
+    if training and self.drop_rate > 0:
+      self.mask = (np.random.rand(*X.shape) >= self.drop_rate) / (
+          1.0 - self.drop_rate
+      )
+      return X * self.mask
+    return X
+
+  def backward(self, dOut):
+    if self.drop_rate > 0:
+      return dOut * self.mask
+    return dOut
+
+
+# --- 5. Loss Function (Binary Cross Entropy) ---
+def compute_bce_loss(y_true, y_pred, layers, l2_lambda):
+  m = y_true.shape[0]
+  eps = 1e-15
+  y_pred = np.clip(y_pred, eps, 1 - eps)
+  data_loss = (
+      -1
+      / m
+      * np.sum(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+  )
+
+  l2_loss = 0
+  for layer in layers:
+    if isinstance(layer, Dense):
+      l2_loss += (l2_lambda / (2 * m)) * np.sum(layer.W ** 2)
+
+  return data_loss + l2_loss
+
+
+# --- 6. Optimization Algorithm (Adam Optimizer) ---
+class AdamOptimizer:
+
+  def __init__(self, layers, lr=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8):
+    self.lr = lr
+    self.beta1 = beta1
+    self.beta2 = beta2
+    self.epsilon = epsilon
+    self.m_w = [np.zeros_like(l.W) for l in layers if isinstance(l, Dense)]
+    self.v_w = [np.zeros_like(l.W) for l in layers if isinstance(l, Dense)]
+    self.m_b = [np.zeros_like(l.b) for l in layers if isinstance(l, Dense)]
+    self.v_b = [np.zeros_like(l.b) for l in layers if isinstance(l, Dense)]
+    self.t = 0
+
+  def update(self, layers):
+    self.t += 1
+    dense_idx = 0
+    for layer in layers:
+      if isinstance(layer, Dense):
+        # Update Weights
+        self.m_w[dense_idx] = (
+            self.beta1 * self.m_w[dense_idx] + (1 - self.beta1) * layer.dW
+        )
+        self.v_w[dense_idx] = (
+            self.beta2 * self.v_w[dense_idx] + (1 - self.beta2) * (layer.dW ** 2)
+        )
+        m_w_corr = self.m_w[dense_idx] / (1 - self.beta1 ** self.t)
+        v_w_corr = self.v_w[dense_idx] / (1 - self.beta2 ** self.t)
+        layer.W -= self.lr * m_w_corr / (np.sqrt(v_w_corr) + self.epsilon)
+
+        # Update Biases
+        self.m_b[dense_idx] = (
+            self.beta1 * self.m_b[dense_idx] + (1 - self.beta1) * layer.db
+        )
+        self.v_b[dense_idx] = (
+            self.beta2 * self.v_b[dense_idx] + (1 - self.beta2) * (layer.db ** 2)
+        )
+        m_b_corr = self.m_b[dense_idx] / (1 - self.beta1 ** self.t)
+        v_b_corr = self.v_b[dense_idx] / (1 - self.beta2 ** self.t)
+        layer.b -= self.lr * m_b_corr / (np.sqrt(v_b_corr) + self.epsilon)
+
+        dense_idx += 1
+
+
+# --- 7. Network Architecture Definition ---
+input_dim = x_train.shape[1]
+l2_lambda = 0.001
+
+layers = [
+    Dense(input_dim, 32, l2_lambda=l2_lambda),
+    ReLU(),
+    Dropout(drop_rate=0.2),
+    Dense(32, 16, l2_lambda=l2_lambda),
+    ReLU(),
+    Dense(16, 1, l2_lambda=l2_lambda),
+    Sigmoid(),
+]
+
+optimizer = AdamOptimizer(layers, lr=0.01)
+
+# --- 8. Training Loop (Epoch, Iteration, Mini-batch) ---
+epochs = 50
+batch_size = 32
+loss_history = []
+
+np.random.seed(42)
+
+for epoch in range(epochs):
+  indices = np.arange(x_train.shape[0])
+  np.random.shuffle(indices)
+  x_train_sh = x_train[indices]
+  y_train_sh = y_train[indices]
+
+  # Iterations over mini-batches
+  for i in range(0, x_train.shape[0], batch_size):
+    x_batch = x_train_sh[i : i + batch_size]
+    y_batch = y_train_sh[i : i + batch_size]
+
+    # Forward Propagation
+    out = x_batch
+    for layer in layers:
+      if isinstance(layer, Dropout):
+        out = layer.forward(out, training=True)
+      else:
+        out = layer.forward(out)
+
+    # Loss Calculation
+    loss = compute_bce_loss(y_batch, out, layers, l2_lambda)
+
+    # Backpropagation
+    grad = out - y_batch
+    for layer in reversed(layers):
+      grad = layer.backward(grad)
+
+    # Parameter Update
+    optimizer.update(layers)
+
+  # Full training pass for monitoring loss per epoch
+  full_out = X_train
+  for layer in layers:
+    if isinstance(layer, Dropout):
+      full_out = layer.forward(full_out, training=False)
+    else:
+      full_out = layer.forward(full_out)
+  epoch_loss = compute_bce_loss(y_train, full_out, layers, l2_lambda)
+  loss_history.append(epoch_loss)
+
+  if (epoch + 1) % 10 == 0:
+    print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss:.4f}")
+
+# --- 9. Inference & Evaluation ---
+test_out = X_test
+for layer in layers:
+  if isinstance(layer, Dropout):
+    test_out = layer.forward(test_out, training=False)
+  else:
+    test_out = layer.forward(test_out)
+
+preds_class = (test_out >= 0.5).astype(int)
+accuracy = np.mean(preds_class == y_test) * 100
+print(f"\nTest Accuracy: {accuracy:.2f}%")
+
+# --- 10. Visualization ---
+plt.plot(loss_history, color="blue", linewidth=2)
+plt.title("Training Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.grid(True)
+plt.show()

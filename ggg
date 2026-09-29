@@ -1,0 +1,296 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+# --- 1. Data Preparation & Validation Split ---
+data = load_breast_cancer()
+x = data.data 
+y = data.target
+y = y.reshape(-1, 1)
+# Chia tập dữ liệu thành Train, Validation và Test
+x_train_full, x_test, y_train_full, y_test = train_test_split(
+    x, y, test_size=0.2, random_state=42)
+x_train, x_val, y_train, y_val = train_test_split(
+    x_train_full, y_train_full, test_size=0.2, random_state=42)
+
+# Input Normalization (Z-score, fit trên train để tránh data leakage)
+scaler = StandardScaler()
+x_train = scaler.fit_transform(x_train)
+x_val = scaler.transform(x_val)
+x_test = scaler.transform(x_test)
+
+
+# --- 2. Activation Functions ---
+class ReLU:
+  def forward(self, Z):
+    self.Z = Z
+    return np.maximum(0, Z)
+  def backward(self, dA):
+    return dA * (self.Z > 0)
+class Sigmoid:
+  def forward(self, Z):
+    self.A = 1 / (1 + np.exp(-np.clip(Z, -500, 500)))
+    return self.A
+  def backward(self, dA):
+    return dA * self.A * (1 - self.A)
+  
+# --- 3. Dense Layer & Dropout ---
+class Dense:
+  def __init__(self, input_dim, output_dim, l2_lambda=0.001):
+    self.W = np.random.randn(input_dim, output_dim) * np.sqrt(2.0 / input_dim)
+    self.b = np.zeros((1, output_dim))
+    self.l2_lambda = l2_lambda
+    self.dW = None
+    self.db = None
+    self.x = None
+
+  def forward(self, x):
+    self.x = x
+    return np.dot(x, self.W) + self.b
+
+  def backward(self, dZ):
+    m = self.x.shape[0]
+    self.dW = np.dot(self.x.T, dZ) / m + self.l2_lambda * self.W
+    self.db = np.sum(dZ, axis=0, keepdims=True) / m
+    return np.dot(dZ, self.W.T)
+
+
+class Dropout:
+
+  def __init__(self, drop_rate=0.2):
+    self.drop_rate = drop_rate
+    self.mask = None
+
+  def forward(self, x, training=True):
+    if training and self.drop_rate > 0:
+      self.mask = (np.random.rand(*x.shape) >= self.drop_rate) / (
+          1.0 - self.drop_rate
+      )
+      return x * self.mask
+    return x
+
+  def backward(self, dropout):
+    if self.drop_rate > 0:
+      return dropout * self.mask
+    return dropout
+
+# --- 4. Loss Function ---
+def compute_bce_loss(y_true, y_pred, layers, l2_lambda):
+  m = y_true.shape[0]
+  eps = 1e-15
+  y_pred = np.clip(y_pred, eps, 1 - eps)
+  bce_loss = (
+      -1/m * np.sum(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)))
+  l2_loss = sum(
+      (l2_lambda / (2 * m)) * np.sum(layer.W ** 2)
+      for layer in layers
+      if isinstance(layer, Dense)
+  )
+  return bce_loss + l2_loss
+
+
+# --- 5. Adam Optimizer ---
+class AdamOptimizer:
+
+  def __init__(self, layers, lr=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8):
+    self.lr = lr
+    self.beta1 = beta1
+    self.beta2 = beta2
+    self.epsilon = epsilon
+    self.m_w = [np.zeros_like(l.W) for l in layers if isinstance(l, Dense)]
+    self.v_w = [np.zeros_like(l.W) for l in layers if isinstance(l, Dense)]
+    self.m_b = [np.zeros_like(l.b) for l in layers if isinstance(l, Dense)]
+    self.v_b = [np.zeros_like(l.b) for l in layers if isinstance(l, Dense)]
+    self.t = 0
+
+  def update(self, layers):
+    self.t += 1
+    idx = 0
+    for layer in layers:
+      if isinstance(layer, Dense):
+        self.m_w[idx] = (
+            self.beta1 * self.m_w[idx] + (1 - self.beta1) * layer.dW
+        )
+        self.v_w[idx] = (
+            self.beta2 * self.v_w[idx] + (1 - self.beta2) * (layer.dW ** 2)
+        )
+        mW_corr = self.m_w[idx] / (1 - self.beta1 ** self.t)
+        vW_corr = self.v_w[idx] / (1 - self.beta2 ** self.t)
+        layer.W -= self.lr * mW_corr / (np.sqrt(vW_corr) + self.epsilon)
+
+        self.m_b[idx] = (
+            self.beta1 * self.m_b[idx] + (1 - self.beta1) * layer.db
+        )
+        self.v_b[idx] = (
+            self.beta2 * self.v_b[idx] + (1 - self.beta2) * (layer.db ** 2)
+        )
+        mB_corr = self.m_b[idx] / (1 - self.beta1 ** self.t)
+        vB_corr = self.v_b[idx] / (1 - self.beta2 ** self.t)
+        layer.b -= self.lr * mB_corr / (np.sqrt(vB_corr) + self.epsilon)
+        idx += 1
+# --- 6. Helper Inference Function ---
+def forward_pass(x, layers, training=False):
+  out = x
+  for layer in layers:
+    if isinstance(layer, Dropout):
+      out = layer.forward(out, training=training)
+    else:
+      out = layer.forward(out)
+  return out
+
+# --- 7. Model Architecture & Training Loop ---
+input_dim =x_train.shape[1]
+l2_lambda = 0.001
+
+layers = [
+    Dense(input_dim, 32, l2_lambda=l2_lambda),
+    ReLU(),
+    Dropout(drop_rate=0.2),
+    Dense(32, 16, l2_lambda=l2_lambda),
+    ReLU(),
+    Dense(16, 1, l2_lambda=l2_lambda),
+    Sigmoid(),
+]
+
+optimizer = AdamOptimizer(layers, lr=0.01)
+
+epochs = 150
+batch_size = 32
+train_loss_hist, val_loss_hist = [], []
+train_acc_hist, val_acc_hist = [], []
+best_val_loss = float("inf")
+best_weights = None
+np.random.seed(42)
+for epoch in range(epochs):
+  indices = np.arange(x_train.shape[0])
+  np.random.shuffle(indices)
+  x_tr_sh = x_train[indices]
+  y_tr_sh = y_train[indices]
+
+  for i in range(0, x_train.shape[0], batch_size):
+    X_b = x_tr_sh[i : i + batch_size]
+    y_b = y_tr_sh[i : i + batch_size]
+
+    out = forward_pass(X_b, layers, training=True)
+    grad = out - y_b
+    for layer in reversed(layers):
+      grad = layer.backward(grad)
+    optimizer.update(layers)
+
+  # Evaluate Train & Validation
+  tr_pred = forward_pass(x_train, layers, training=False)
+  val_pred = forward_pass(x_val, layers, training=False)
+  tr_loss = compute_bce_loss(y_train, tr_pred, layers, l2_lambda)
+  val_loss = compute_bce_loss(y_val, val_pred, layers, l2_lambda)
+  tr_acc = np.mean((tr_pred >= 0.5).astype(int) == y_train)
+  val_acc = np.mean((val_pred >= 0.5).astype(int) == y_val)
+  train_loss_hist.append(tr_loss)
+  val_loss_hist.append(val_loss)
+  train_acc_hist.append(tr_acc)
+  val_acc_hist.append(val_acc)
+
+  # Save best weights based on validation loss
+  if val_loss < best_val_loss:
+    best_val_loss = val_loss
+    best_weights = [
+        (l.W.copy(), l.b.copy()) for l in layers if isinstance(l, Dense)
+    ]
+
+# Restore best weights
+idx = 0
+for layer in layers:
+  if isinstance(layer, Dense):
+    layer.W, layer.b = best_weights[idx]
+    idx += 1
+
+# --- 8. Evaluation on Test Set & Metrics ---
+test_pred = forward_pass(x_test, layers, training=False)
+test_pred_class = (test_pred >= 0.5).astype(int)
+
+tp = np.sum((test_pred_class == 1) & (y_test == 1))
+tn = np.sum((test_pred_class == 0) & (y_test == 0))
+fp = np.sum((test_pred_class == 1) & (y_test == 0))
+fn = np.sum((test_pred_class == 0) & (y_test == 1))
+
+accuracy = (tp + tn) / len(y_test)
+precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+f1 = (
+    2*precision*recall / (precision + recall)
+    if (precision + recall) > 0
+    else 0
+)
+
+print(f"Test Accuracy: {accuracy*100:.2f}%")
+print(f"Precision: {precision*100:.2f}%")
+print(f"Recall: {recall*100:.2f}%")
+print(f"F1-score: {f1*100:.2f}%")
+
+# ROC and AUC calculation
+thresholds = np.linspace(0, 1, 100)
+tpr_list, fpr_list = [], []
+for th in thresholds:
+  preds_th = (test_pred >= th).astype(int)
+  t_pos = np.sum((preds_th == 1) & (y_test == 1))
+  f_neg = np.sum((preds_th == 0) & (y_test == 1))
+  f_pos = np.sum((preds_th == 1) & (y_test == 0))
+  t_neg = np.sum((preds_th == 0) & (y_test == 0))
+  tpr = t_pos / (t_pos + f_neg) if (t_pos + f_neg) > 0 else 0
+  fpr = f_pos / (f_pos + t_neg) if (f_pos + t_neg) > 0 else 0
+  tpr_list.append(tpr)
+  fpr_list.append(fpr)
+
+sorted_indices = np.argsort(fpr_list)
+fpr_arr = np.array(fpr_list)[sorted_indices]
+tpr_arr = np.array(tpr_list)[sorted_indices]
+auc = np.trapezoid(tpr_arr, fpr_arr)
+print(f"AUC: {auc:.4f}")
+
+# --- 9. Plotting 4 Subplots ---
+fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+
+axs[0, 0].plot(train_loss_hist, label="Train")
+axs[0, 0].plot(val_loss_hist, label="Validation")
+axs[0, 0].set_title("Loss theo epoch")
+axs[0, 0].set_xlabel("Epoch")
+axs[0, 0].set_ylabel("Loss (BCE + L2)")
+axs[0, 0].legend()
+axs[0, 0].grid(True, alpha=0.3)
+axs[0, 1].plot(train_acc_hist, label="Train")
+axs[0, 1].plot(val_acc_hist, label="Validation")
+axs[0, 1].set_title("Accuracy theo epoch")
+axs[0, 1].set_xlabel("Epoch")
+axs[0, 1].set_ylabel("Accuracy")
+axs[0, 1].legend()
+axs[0, 1].grid(True, alpha=0.3)
+
+cm = np.array([[tn, fp], [fn, tp]])
+axs[1, 0].imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+axs[1, 0].set_title("Confusion Matrix (tập test)")
+axs[1, 0].set_xticks([0, 1])
+axs[1, 0].set_yticks([0, 1])
+axs[1, 0].set_xticklabels(["Lành tính", "Ác tính"])
+axs[1, 0].set_yticklabels(["Lành tính", "Ác tính"])
+axs[1, 0].set_ylabel("Thực tế")
+axs[1, 0].set_xlabel("Dự đoán")
+for i in range(2):
+  for j in range(2):
+    axs[1, 0].text(
+        j,
+        i,
+        str(cm[i, j]),
+        ha="center",
+        va="center",
+        color="white" if cm[i, j] > cm.max() / 2 else "black",
+        fontsize=14,
+    )
+axs[1, 1].plot(fpr_arr, tpr_arr, label=f"AUC = {auc:.4f}")
+axs[1, 1].plot([0, 1], [0, 1], "k--", alpha=0.5)
+axs[1, 1].set_title("Đường cong ROC")
+axs[1, 1].set_xlabel("False Positive Rate")
+axs[1, 1].set_ylabel("True Positive Rate")
+axs[1, 1].legend(loc="lower right")
+axs[1, 1].grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()

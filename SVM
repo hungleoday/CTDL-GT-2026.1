@@ -1,0 +1,72 @@
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.svm import SVC
+#Xử lí dữ liệu
+df = pd.read_csv(r'D:/HUST/Python-Project/.vscode/student_performance_dataset.csv')
+cat_cols = [
+    'gender',
+    'parental_education',
+    'internet_access',
+    'extracurricular_activities',
+    'part_time_job',
+]
+for col in cat_cols:
+  df[col] = LabelEncoder().fit_transform(df[col])
+X = df.drop(columns=['final_exam_score', 'final_grade']).to_numpy()
+y = df['final_grade'].to_numpy()
+classes = ['A', 'B', 'C', 'D', 'F']
+class_to_idx = {label: i for i, label in enumerate(classes)}
+num_classes = len(classes)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=20)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+#Huấn luyện mô hình SVM
+model = SVC()
+model.fit(X_train_scaled, y_train)
+y_pred = model.predict(X_test_scaled)
+#Kết quả
+correct_count = np.sum(y_pred == y_test)
+acc = correct_count / len(y_test)
+print(f'Accuracy: {acc:.4f}')
+#Confusion matrix, precision, recall, f1-score
+conf_matrix = np.zeros((num_classes, num_classes), dtype=int)
+for true_val, pred_val in zip(y_test, y_pred):
+  if true_val in class_to_idx and pred_val in class_to_idx:
+    conf_matrix[class_to_idx[true_val], class_to_idx[pred_val]] += 1
+print('Confusion Matrix')
+print(conf_matrix)
+print(f"{'':>10} {'precision':>12} {'recall':>12} {'f1-score':>12}\n")
+for i, label in enumerate(classes):
+  tp = conf_matrix[i, i]
+  fp = np.sum(conf_matrix[:, i]) - tp
+  fn = np.sum(conf_matrix[i, :]) - tp
+  precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+  recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+  f1 = (
+      (2 * precision * recall) / (precision + recall)
+      if (precision + recall) > 0
+      else 0.0
+  )
+  print(f'{label:>12} {precision:12.2f} {recall:12.2f} {f1:12.2f}')
+#K-fold cross validation
+print('\nK-Fold Cross Validation (k=5)')
+kf = KFold(n_splits=5, shuffle=True, random_state=20)
+fold_accuracies = []
+for train_idx_k, test_idx_k in kf.split(X):
+  X_tr, X_te = X[train_idx_k], X[test_idx_k]
+  y_tr, y_te = y[train_idx_k], y[test_idx_k]
+  scaler_k = StandardScaler()
+  X_tr_sc = scaler_k.fit_transform(X_tr)
+  X_te_sc = scaler_k.transform(X_te)
+  model_k = SVC()
+  model_k.fit(X_tr_sc, y_tr)
+  y_pred_k = model_k.predict(X_te_sc)
+  acc_k = np.sum(y_pred_k == y_te) / len(y_te)
+  fold_accuracies.append(float(round(acc_k, 3)))
+print(f'Accuracy từng fold: {fold_accuracies}')
+mean_acc = np.mean(fold_accuracies)
+std_acc = np.std(fold_accuracies)
+print(f'Accuracy trung bình: {mean_acc:.4f} (+/- {std_acc * 2:.4f})')

@@ -1,0 +1,26 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. Đọc file npy
+raw_data = np.load("force_torque.npy", allow_pickle=True)
+data = raw_data.item() if raw_data.ndim == 0 else raw_data
+
+# 2. Lấy trực tiếp từ dictionary theo key
+timestamps = np.array(data["timestamp"])
+force_torque_values = np.array(data["zeroed"])  # hoặc dùng 'raw' tùy bạn
+
+# 3. Vẽ đồ thị
+plt.figure(figsize=(12, 6))
+
+plt.plot(timestamps, force_torque_values[:, 0], label="Fx")
+plt.plot(timestamps, force_torque_values[:, 1], label="Fy")
+plt.plot(timestamps, force_torque_values[:, 2], label="Fz")
+
+plt.xlabel("Timestamp")
+plt.ylabel("Force / Torque")
+plt.title("Biểu đồ biến động lực theo thời gian")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.show()

@@ -1,0 +1,320 @@
+import numpy as np
+import matplotlib.pyplot as plt
+np.random.seed(42)
+# 1. Dữ liệu
+def load_data():
+    try:
+        from sklearn.datasets import load_breast_cancer
+        data = load_breast_cancer()
+        X = data.data.astype(np.float64)
+        # sklearn: 0 = ác tính, 1 = lành tính -> đảo lại cho 1 = ác tính (dương tính)
+        y = (1 - data.target).reshape(-1, 1)
+        print(f"Đã tải Breast Cancer Wisconsin: {X.shape[0]} mẫu, {X.shape[1]} đặc trưng")
+    except ImportError:
+        print("Không có sklearn -> dùng dữ liệu giả lập (2 cụm Gaussian)")
+        n = 569
+        n_pos = 212
+        X_pos = np.random.randn(n_pos, 30) * 1.5 + 2.0
+        X_neg = np.random.randn(n - n_pos, 30) * 1.5 - 1.0
+        X = np.vstack([X_pos, X_neg])
+        y = np.vstack([np.ones((n_pos, 1)), np.zeros((n - n_pos, 1))])
+    return X, y
+
+def split_data(X, y, val_ratio=0.15, test_ratio=0.15):
+    m = X.shape[0]
+    idx = np.random.permutation(m)
+    X, y = X[idx], y[idx]
+    n_test = int(m * test_ratio)
+    n_val = int(m * val_ratio)
+    X_test, y_test = X[:n_test], y[:n_test]
+    X_val, y_val = X[n_test:n_test + n_val], y[n_test:n_test + n_val]
+    X_train, y_train = X[n_test + n_val:], y[n_test + n_val:]
+    return X_train, y_train, X_val, y_val, X_test, y_test
+
+def normalize(X_train, X_val, X_test):
+    """Z-score. Mean/std chỉ lấy từ train."""
+    mean = X_train.mean(axis=0, keepdims=True)
+    std = X_train.std(axis=0, keepdims=True) + 1e-8  # tránh chia cho 0
+    return (X_train - mean) / std, (X_val - mean) / std, (X_test - mean) / std
+
+# 2. Các hàm kích hoạt
+def relu(z):
+    return np.maximum(0, z)
+def sigmoid(z):
+    z = np.clip(z, -500, 500)  # tránh overflow trong exp
+    return 1 / (1 + np.exp(-z))
+# 3. Mạng neural
+class NeuralNetwork:
+    def __init__(self, layer_sizes, lr=0.001, l2_lambda=0.01, keep_prob=0.8,
+                 beta1=0.9, beta2=0.999, epsilon=1e-8):
+        self.layer_sizes = layer_sizes
+        self.L = len(layer_sizes) - 1
+        self.lr = lr
+        self.l2_lambda = l2_lambda
+        self.keep_prob = keep_prob
+        self.beta1, self.beta2, self.epsilon = beta1, beta2, epsilon
+        self.params = {}
+        self._init_params()
+        self._init_adam()
+    def He_init(self):
+        for l in range(1, self.L + 1):
+            n_in, n_out = self.layer_sizes[l - 1], self.layer_sizes[l]
+            self.params[f"W{l}"] = np.random.randn(n_in, n_out) * np.sqrt(2.0 / n_in)
+            self.params[f"b{l}"] = np.zeros((1, n_out))
+    def init_adam(self):
+        self.m = {k: np.zeros_like(v) for k, v in self.params.items()}
+        self.v = {k: np.zeros_like(v) for k, v in self.params.items()}
+        self.t = 0 
+    def forward(self, X, training=True):
+        cache = {"A0": X}
+        A = X
+        for l in range(1, self.L + 1):
+            W, b = self.params[f"W{l}"], self.params[f"b{l}"]
+            Z = A @ W + b
+            cache[f"Z{l}"] = Z
+
+            if l == self.L:
+                A = sigmoid(Z)  # lớp ra
+            else:
+                A = relu(Z)
+                if training and self.keep_prob < 1.0:
+                    mask = (np.random.rand(*A.shape) < self.keep_prob).astype(np.float64)
+                    A = A * mask / self.keep_prob
+                    cache[f"D{l}"] = mask
+            cache[f"A{l}"] = A
+        return A, cache
+    def bce_loss(self, y_pred, y_true):
+        m = y_true.shape[0]
+        y_pred = np.clip(y_pred, 1e-12, 1 - 1e-12)
+        bce = -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+        l2_cost = 0.0
+        for l in range(1, self.L + 1):
+            l2_cost += np.sum(self.params[f"W{l}"] ** 2)
+        l2_cost *= self.l2_lambda / (2 * m)
+        return bce + l2_cost
+    # ---------------- Backward ----------------
+    def backward(self, y_true, cache):
+        m = y_true.shape[0]
+        grads = {}
+        dZ = cache[f"A{self.L}"] - y_true
+        for l in range(self.L, 0, -1):
+            A_prev = cache[f"A{l - 1}"]
+            W = self.params[f"W{l}"]
+            grads[f"W{l}"] = A_prev.T @ dZ / m + (self.l2_lambda / m) * W  # cộng gradient L2
+            grads[f"b{l}"] = np.sum(dZ, axis=0, keepdims=True) / m
+            if l > 1:
+                dA_prev = dZ @ W.T
+                # dropout ở lớp l-1: áp lại đúng mask đã dùng lúc forward
+                if f"D{l - 1}" in cache:
+                    dA_prev = dA_prev * cache[f"D{l - 1}"] / self.keep_prob
+                dZ = dA_prev * (cache[f"Z{l - 1}"] > 0)  # đạo hàm ReLU
+        return grads
+    # ---------------- Adam ----------------
+    def adam(self, grads):
+        self.t += 1
+        for k in self.params:
+            self.m[k] = self.beta1 * self.m[k] + (1 - self.beta1) * grads[k]
+            self.v[k] = self.beta2 * self.v[k] + (1 - self.beta2) * grads[k] ** 2
+
+            m_hat = self.m[k] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[k] / (1 - self.beta2 ** self.t)
+
+            self.params[k] -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
+    def predict_prob(self, X):
+        A, _ = self.forward(X, training=False)
+        return A
+    def predict(self, X, threshold=0.5):
+        return (self.predict_proba(X) >= threshold).astype(int)
+    def fit(self, X_train, y_train, X_val, y_val, epochs=150, batch_size=32, verbose=True):
+        history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+        best_val_loss = np.inf
+        best_params = None
+        m = X_train.shape[0]
+        for epoch in range(1, epochs + 1):
+            idx = np.random.permutation(m)
+            X_shuf, y_shuf = X_train[idx], y_train[idx]
+            for i in range(0, m, batch_size):
+                X_batch = X_shuf[i:i + batch_size]
+                y_batch = y_shuf[i:i + batch_size]
+                y_hat, cache = self.forward(X_batch, training=True)
+                grads = self.backward(y_batch, cache)
+                self.update_params(grads)
+            p_train = self.predict_proba(X_train)
+            p_val = self.predict_proba(X_val)
+            tl = self.compute_loss(p_train, y_train)
+            vl = self.compute_loss(p_val, y_val)
+            ta = np.mean((p_train >= 0.5) == y_train)
+            va = np.mean((p_val >= 0.5) == y_val)
+            history["train_loss"].append(tl)
+            history["val_loss"].append(vl)
+            history["train_acc"].append(ta)
+            history["val_acc"].append(va)
+            if vl < best_val_loss:
+                best_val_loss = vl
+                best_params = {k: v.copy() for k, v in self.params.items()}
+            if verbose and (epoch % 10 == 0 or epoch == 1):
+                print(f"Epoch {epoch:3d}/{epochs} | loss {tl:.4f} | val_loss {vl:.4f} "
+                      f"| acc {ta:.4f} | val_acc {va:.4f}")
+        self.params = best_params  # quay về mô hình tốt nhất
+        print(f"\nVal loss tốt nhất: {best_val_loss:.4f}")
+        return history
+    
+# 4. Kiểm tra gradient (đối chiếu backprop với đạo hàm số)
+def gradient_check(net, X, y, eps=1e-5, n_checks=10):
+    old_keep = net.keep_prob
+    net.keep_prob = 1.0
+    y_hat, cache = net.forward(X, training=False)
+    grads = net.backward(y, cache)
+
+    max_err = 0.0
+    for key in net.params:
+        param = net.params[key]
+        flat_idx = np.random.choice(param.size, min(n_checks, param.size), replace=False)
+        for fi in flat_idx:
+            idx = np.unravel_index(fi, param.shape)
+            original = param[idx]
+
+            param[idx] = original + eps
+            loss_plus = net.compute_loss(net.forward(X, training=False)[0], y)
+            param[idx] = original - eps
+            loss_minus = net.compute_loss(net.forward(X, training=False)[0], y)
+            param[idx] = original
+
+            num_grad = (loss_plus - loss_minus) / (2 * eps)
+            ana_grad = grads[key][idx]
+            err = abs(num_grad - ana_grad) / (abs(num_grad) + abs(ana_grad) + 1e-12)
+            max_err = max(max_err, err)
+
+    net.keep_prob = old_keep
+    status = "OK" if max_err < 1e-5 else "CÓ VẤN ĐỀ"
+    print(f"Gradient check: sai số tương đối lớn nhất = {max_err:.2e} -> {status}")
+
+
+# ----------------------------------------------------------------------
+# 5. Đánh giá
+# ----------------------------------------------------------------------
+def confusion_matrix(y_true, y_pred):
+    y_true, y_pred = y_true.ravel(), y_pred.ravel()
+    tn = np.sum((y_true == 0) & (y_pred == 0))
+    fp = np.sum((y_true == 0) & (y_pred == 1))
+    fn = np.sum((y_true == 1) & (y_pred == 0))
+    tp = np.sum((y_true == 1) & (y_pred == 1))
+    return np.array([[tn, fp], [fn, tp]])
+
+
+def print_metrics(cm):
+    tn, fp, fn, tp = cm.ravel()
+    acc = (tp + tn) / cm.sum()
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)  # với ung thư, recall quan trọng nhất (đừng bỏ sót ca ác tính)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+    print(f"Accuracy : {acc:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall   : {recall:.4f}")
+    print(f"F1-score : {f1:.4f}")
+
+
+def roc_curve(y_true, y_score):
+    y_true, y_score = y_true.ravel(), y_score.ravel()
+    thresholds = np.linspace(1, 0, 200)
+    tpr, fpr = [], []
+    P, N = np.sum(y_true == 1), np.sum(y_true == 0)
+    for t in thresholds:
+        pred = y_score >= t
+        tpr.append(np.sum(pred & (y_true == 1)) / P)
+        fpr.append(np.sum(pred & (y_true == 0)) / N)
+    tpr, fpr = np.array(tpr), np.array(fpr)
+    auc = np.trapezoid(tpr, fpr) if hasattr(np, "trapezoid") else np.trapz(tpr, fpr)
+    return fpr, tpr, auc
+
+
+# ----------------------------------------------------------------------
+# 6. Vẽ biểu đồ
+# ----------------------------------------------------------------------
+def plot_results(history, cm, fpr, tpr, auc, save_path="ket_qua.png"):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    # Loss
+    axes[0, 0].plot(history["train_loss"], label="Train")
+    axes[0, 0].plot(history["val_loss"], label="Validation")
+    axes[0, 0].set_title("Loss theo epoch")
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].set_ylabel("Loss (BCE + L2)")
+    axes[0, 0].legend()
+    axes[0, 0].grid(alpha=0.3)
+
+    # Accuracy
+    axes[0, 1].plot(history["train_acc"], label="Train")
+    axes[0, 1].plot(history["val_acc"], label="Validation")
+    axes[0, 1].set_title("Accuracy theo epoch")
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].set_ylabel("Accuracy")
+    axes[0, 1].legend()
+    axes[0, 1].grid(alpha=0.3)
+
+    # Confusion matrix
+    ax = axes[1, 0]
+    ax.imshow(cm, cmap="Blues")
+    ax.set_title("Confusion Matrix (tập test)")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(["Lành tính", "Ác tính"])
+    ax.set_yticklabels(["Lành tính", "Ác tính"])
+    ax.set_xlabel("Dự đoán")
+    ax.set_ylabel("Thực tế")
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                    color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=16)
+
+    # ROC
+    axes[1, 1].plot(fpr, tpr, label=f"AUC = {auc:.4f}")
+    axes[1, 1].plot([0, 1], [0, 1], "k--", alpha=0.5)
+    axes[1, 1].set_title("Đường cong ROC")
+    axes[1, 1].set_xlabel("False Positive Rate")
+    axes[1, 1].set_ylabel("True Positive Rate")
+    axes[1, 1].legend(loc="lower right")
+    axes[1, 1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    print(f"Đã lưu biểu đồ vào {save_path}")
+    plt.show()
+
+
+# ----------------------------------------------------------------------
+# 7. Chạy chương trình
+# ----------------------------------------------------------------------
+def main():
+    X, y = load_data()
+    X_train, y_train, X_val, y_val, X_test, y_test = split_data(X, y)
+    X_train, X_val, X_test = normalize(X_train, X_val, X_test)
+    print(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}\n")
+
+    n_features = X_train.shape[1]
+    net = NeuralNetwork(
+        layer_sizes=[n_features, 32, 16, 1],
+        lr=0.001,
+        l2_lambda=0.1,
+        keep_prob=0.8,
+    )
+
+    # kiểm tra backprop trước khi train
+    gradient_check(net, X_train[:20], y_train[:20])
+    print()
+
+    history = net.fit(X_train, y_train, X_val, y_val, epochs=150, batch_size=32)
+
+    print("\n===== Kết quả trên tập test =====")
+    y_pred = net.predict(X_test)
+    cm = confusion_matrix(y_test, y_pred)
+    print_metrics(cm)
+
+    fpr, tpr, auc = roc_curve(y_test, net.predict_proba(X_test))
+    print(f"AUC      : {auc:.4f}")
+
+    plot_results(history, cm, fpr, tpr, auc)
+
+
+if __name__ == "__main__":
+    main()
